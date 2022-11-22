@@ -31,6 +31,8 @@ struct Game {
     frame_count: Watcher<u16>,
     uix_position: Watcher<i32>,
     uiy_position: Watcher<i32>,
+    // This is not the target position, it doesn't always update.
+    link_position_y: Watcher<u16>,
     visual_rupees: Watcher<u16>,
     visual_hearts: Watcher<u8>,
     visual_keys: Watcher<u8>,
@@ -39,17 +41,19 @@ struct Game {
     bombs: Watcher<u8>,
     accumulated_frame_count: i64,
     delayed_split: Option<(&'static str, i64)>,
-    visited_scenes: VisitedScenes,
+    run_progress: RunProgress,
 }
 
 #[derive(Default)]
-struct VisitedScenes {
+struct RunProgress {
+    smiths_sword: bool,
     deepwood_shrine: bool,
     deepwood_shrine_boss: bool,
     mt_crenel: bool,
     cave_of_flames: bool,
     cave_of_flames_boss: bool,
     fortress_of_winds: bool,
+    fortress_of_winds_boss: bool,
     temple_of_droplets: bool,
     palace_of_winds: bool,
 }
@@ -66,6 +70,7 @@ impl Game {
             frame_count: Watcher::new(0x300100C),
             uix_position: Watcher::new(0x3001E4E),
             uiy_position: Watcher::new(0x300187A),
+            link_position_y: Watcher::new(0x30010BE),
             visual_rupees: Watcher::new(0x200AF0E),
             visual_hearts: Watcher::new(0x200AF03),
             visual_keys: Watcher::new(0x200AF12),
@@ -74,7 +79,7 @@ impl Game {
             bombs: Watcher::new(0x2002AEC),
             accumulated_frame_count: 0,
             delayed_split: None,
-            visited_scenes: Default::default(),
+            run_progress: Default::default(),
         }
     }
 
@@ -88,6 +93,7 @@ impl Game {
             frame_count: self.frame_count.update(&self.emulator)?,
             uix_position: self.uix_position.update(&self.emulator)?,
             uiy_position: self.uiy_position.update(&self.emulator)?,
+            link_position_y: self.link_position_y.update(&self.emulator)?,
             visual_rupees: self.visual_rupees.update(&self.emulator)?,
             visual_hearts: self.visual_hearts.update(&self.emulator)?,
             visual_keys: self.visual_keys.update(&self.emulator)?,
@@ -96,7 +102,7 @@ impl Game {
             bombs: self.bombs.update(&self.emulator)?,
             accumulated_frame_count: &mut self.accumulated_frame_count,
             delayed_split: &mut self.delayed_split,
-            visited_scenes: &mut self.visited_scenes,
+            run_progress: &mut self.run_progress,
         })
     }
 }
@@ -110,6 +116,8 @@ struct Vars<'a> {
     frame_count: &'a Pair<u16>,
     uix_position: &'a Pair<i32>,
     uiy_position: &'a Pair<i32>,
+    // This is not the target position, it doesn't always update.
+    link_position_y: &'a Pair<u16>,
     visual_rupees: &'a Pair<u16>,
     visual_hearts: &'a Pair<u8>,
     visual_keys: &'a Pair<u8>,
@@ -118,7 +126,7 @@ struct Vars<'a> {
     bombs: &'a Pair<u8>,
     accumulated_frame_count: &'a mut i64,
     delayed_split: &'a mut Option<(&'static str, i64)>,
-    visited_scenes: &'a mut VisitedScenes,
+    run_progress: &'a mut RunProgress,
 }
 
 impl Vars<'_> {
@@ -179,10 +187,10 @@ bitflags::bitflags! {
         const BOW2 = 1 << 4;
         const BOOMERANG = 1 << 6;
 
-        const BOOMERANG2 = 1 << 0;
+        const MAGICAL_BOOMERANG = 1 << 0;
         const SHIELD = 1 << 2;
         const MIRROR_SHIELD = 1 << 4;
-        const LAMP = 1 << 6;
+        const FLAME_LANTERN = 1 << 6;
 
         const LAMP2 = 1 << 0;
         const GUST_JAR = 1 << 2;
@@ -236,6 +244,7 @@ impl Scene {
     const DEEPWOOD_SHRINE_BOSS: Self = Self(0x49);
     const CAVE_OF_FLAMES: Self = Self(0x50);
     const CAVE_OF_FLAMES_BOSS: Self = Self(0x51);
+    const FORTRESS_OF_WINDS_GREEN_FLOOR: Self = Self(0x58);
     const TEMPLE_OF_DROPLETS: Self = Self(0x60);
     const PALACE_OF_WINDS: Self = Self(0x70);
     const HYRULE_CASTLE: Self = Self(0x80);
@@ -268,10 +277,10 @@ mod inventory_slot {
     pub const BOW2: usize = 2;
     pub const BOOMERANG: usize = 2;
 
-    pub const BOOMERANG2: usize = 3;
+    pub const MAGICAL_BOOMERANG: usize = 3;
     pub const SHIELD: usize = 3;
     pub const MIRROR_SHIELD: usize = 3;
-    pub const LAMP: usize = 3;
+    pub const FLAME_LANTERN: usize = 3;
 
     pub const LAMP2: usize = 4;
     pub const GUST_JAR: usize = 4;
@@ -310,7 +319,7 @@ pub extern "C" fn update() {
                         && vars.uiy_position.current > 144
                     {
                         *vars.accumulated_frame_count = -(vars.frame_count.current as i64);
-                        *vars.visited_scenes = Default::default();
+                        *vars.run_progress = Default::default();
                         timer::start();
                         timer::pause_game_time();
                     }
@@ -344,7 +353,13 @@ fn should_split(vars: &mut Vars) -> Option<&'static str> {
         .pause_menu
         .check(|menu| menu.has_item(inventory_slot::SMITHS_SWORD, InventoryItem::SMITHS_SWORD))
     {
+        // Workaround to detect loading a save file.
+        if vars.run_progress.smiths_sword {
+            return None;
+        }
+
         // Get Smith's Sword
+        vars.run_progress.smiths_sword = true;
         return Some("Get Smith's Sword");
     }
     if vars
@@ -356,9 +371,9 @@ fn should_split(vars: &mut Vars) -> Option<&'static str> {
         *vars.delayed_split = Some(("Receive Minish Cap", vars.frame_count() + 20));
         return None;
     }
-    if !vars.visited_scenes.deepwood_shrine && vars.scene.current == Scene::DEEPWOOD_SHRINE {
+    if !vars.run_progress.deepwood_shrine && vars.scene.current == Scene::DEEPWOOD_SHRINE {
         // Enter Deepwood Shrine
-        vars.visited_scenes.deepwood_shrine = true;
+        vars.run_progress.deepwood_shrine = true;
         return Some("Enter Deepwood Shrine");
     }
     if vars
@@ -368,11 +383,10 @@ fn should_split(vars: &mut Vars) -> Option<&'static str> {
         // Get Gust Jar
         return Some("Get Gust Jar");
     }
-    if !vars.visited_scenes.deepwood_shrine_boss
-        && vars.scene.current == Scene::DEEPWOOD_SHRINE_BOSS
+    if !vars.run_progress.deepwood_shrine_boss && vars.scene.current == Scene::DEEPWOOD_SHRINE_BOSS
     {
         // Enter Deepwood Shrine Boss Room
-        vars.visited_scenes.deepwood_shrine_boss = true;
+        vars.run_progress.deepwood_shrine_boss = true;
         return Some("Enter Deepwood Shrine Boss Room");
     }
     if vars
@@ -382,9 +396,9 @@ fn should_split(vars: &mut Vars) -> Option<&'static str> {
         // Get Earth Element
         return Some("Get Earth Element");
     }
-    if !vars.visited_scenes.mt_crenel && vars.scene.current == Scene::MT_CRENEL {
+    if !vars.run_progress.mt_crenel && vars.scene.current == Scene::MT_CRENEL {
         // Enter Mt. Crenel
-        vars.visited_scenes.mt_crenel = true;
+        vars.run_progress.mt_crenel = true;
         return Some("Enter Mt. Crenel");
     }
     if vars.pause_menu.check(|menu| {
@@ -394,9 +408,9 @@ fn should_split(vars: &mut Vars) -> Option<&'static str> {
         // Get Grip Ring
         return Some("Get Grip Ring");
     }
-    if !vars.visited_scenes.cave_of_flames && vars.scene.current == Scene::CAVE_OF_FLAMES {
+    if !vars.run_progress.cave_of_flames && vars.scene.current == Scene::CAVE_OF_FLAMES {
         // Enter Cave of Flames
-        vars.visited_scenes.cave_of_flames = true;
+        vars.run_progress.cave_of_flames = true;
         return Some("Enter Cave of Flames");
     }
     if vars
@@ -406,10 +420,9 @@ fn should_split(vars: &mut Vars) -> Option<&'static str> {
         // Get Cane of Pacci
         return Some("Get Cane of Pacci");
     }
-    if !vars.visited_scenes.cave_of_flames_boss && vars.scene.current == Scene::CAVE_OF_FLAMES_BOSS
-    {
+    if !vars.run_progress.cave_of_flames_boss && vars.scene.current == Scene::CAVE_OF_FLAMES_BOSS {
         // Enter Cave of Flames Boss Room
-        vars.visited_scenes.cave_of_flames_boss = true;
+        vars.run_progress.cave_of_flames_boss = true;
         return Some("Enter Cave of Flames Boss Room");
     }
     if vars
@@ -426,9 +439,16 @@ fn should_split(vars: &mut Vars) -> Option<&'static str> {
         // Get Pegasus Boots
         return Some("Get Pegasus Boots");
     }
-    if !vars.visited_scenes.fortress_of_winds && vars.scene.current == Scene::FORTRESS_OF_WINDS {
+    if vars
+        .pause_menu
+        .check(|menu| menu.has_item(inventory_slot::BOW, InventoryItem::BOW))
+    {
+        // Get Bow
+        return Some("Get Bow");
+    }
+    if !vars.run_progress.fortress_of_winds && vars.scene.current == Scene::FORTRESS_OF_WINDS {
         // Enter Fortress of Winds
-        vars.visited_scenes.fortress_of_winds = true;
+        vars.run_progress.fortress_of_winds = true;
         return Some("Enter Fortress of Winds");
     }
     if vars
@@ -438,6 +458,14 @@ fn should_split(vars: &mut Vars) -> Option<&'static str> {
         // Get Mole Mitts
         return Some("Get Mole Mitts");
     }
+    if !vars.run_progress.fortress_of_winds_boss
+        && vars.scene.current == Scene::FORTRESS_OF_WINDS_GREEN_FLOOR
+        && vars.link_position_y.current <= 1015
+    {
+        // Enter Fortress of Winds Boss Room
+        vars.run_progress.fortress_of_winds_boss = true;
+        return Some("Enter Fortress of Winds Boss Room");
+    }
     if vars
         .pause_menu
         .check(|menu| menu.has_item(inventory_slot::OCARINA, InventoryItem::OCARINA))
@@ -446,24 +474,41 @@ fn should_split(vars: &mut Vars) -> Option<&'static str> {
         return Some("Get Ocarina");
     }
     if vars.pause_menu.check(|menu| {
+        menu.has_item(
+            inventory_slot::MAGICAL_BOOMERANG,
+            InventoryItem::MAGICAL_BOOMERANG,
+        )
+    }) {
+        // Get Magical Boomerang
+        return Some("Get Magical Boomerang");
+    }
+    if vars.pause_menu.check(|menu| {
+        menu.permanent_equipment
+            .contains(PermanentEquipment::POWER_BRACELETS)
+    }) {
+        // Get Power Bracelets
+        return Some("Get Power Bracelets");
+    }
+    if vars.pause_menu.check(|menu| {
         menu.permanent_equipment
             .contains(PermanentEquipment::FLIPPERS)
     }) {
         // Get Flippers
         return Some("Get Flippers");
     }
-    if !vars.visited_scenes.temple_of_droplets && vars.scene.current == Scene::TEMPLE_OF_DROPLETS {
+    if !vars.run_progress.temple_of_droplets && vars.scene.current == Scene::TEMPLE_OF_DROPLETS {
         // Enter Temple of Droplets
-        vars.visited_scenes.temple_of_droplets = true;
+        vars.run_progress.temple_of_droplets = true;
         return Some("Enter Temple of Droplets");
     }
     if vars
         .pause_menu
-        .check(|menu| menu.has_item(inventory_slot::LAMP, InventoryItem::LAMP))
+        .check(|menu| menu.has_item(inventory_slot::FLAME_LANTERN, InventoryItem::FLAME_LANTERN))
     {
-        // Get Lamp
-        return Some("Get Lamp");
+        // Get Flame Lantern
+        return Some("Get Flame Lantern");
     }
+    // TODO: Enter Octo
     if vars
         .pause_menu
         .check(|menu| menu.elements.contains(Elements::WATER))
@@ -471,9 +516,9 @@ fn should_split(vars: &mut Vars) -> Option<&'static str> {
         // Get Water Element
         return Some("Get Water Element");
     }
-    if !vars.visited_scenes.palace_of_winds && vars.scene.current == Scene::PALACE_OF_WINDS {
+    if !vars.run_progress.palace_of_winds && vars.scene.current == Scene::PALACE_OF_WINDS {
         // Enter Palace of Winds
-        vars.visited_scenes.palace_of_winds = true;
+        vars.run_progress.palace_of_winds = true;
         return Some("Enter Palace of Winds");
     }
     if vars
@@ -483,6 +528,7 @@ fn should_split(vars: &mut Vars) -> Option<&'static str> {
         // Get Roc's Cape
         return Some("Get Roc's Cape");
     }
+    // TODO: Enter Gyorg
     if vars
         .pause_menu
         .check(|menu| menu.elements.contains(Elements::WIND))
@@ -498,10 +544,16 @@ fn should_split(vars: &mut Vars) -> Option<&'static str> {
         *vars.delayed_split = Some(("Get Four Sword", vars.frame_count() + 244));
         return None;
     }
+    // TODO: Enter DHC
+    // TODO: 2nd Key in DHC
+    // TODO: Black Knight
     if vars.dhc_big_key.check(|&v| v & 4 != 0) {
         // Get DHC Big Key
         return Some("Get DHC Big Key");
     }
+    // TODO: Darknuts
+    // TODO: Vaati 1
+    // TODO: Vaati 2
     if vars.scene.current == Scene::VAATI3
         && vars.vaati3_phases.old == 1
         && vars.vaati3_phases.current == 0
