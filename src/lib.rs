@@ -1,27 +1,20 @@
 #![no_std]
 
-use arrayvec::ArrayString;
 use asr::{
-    gba, itoa,
+    arrayvec::ArrayString,
+    emulator::gba,
+    future::{next_tick, retry},
+    itoa,
+    settings::Gui,
     time_util::frame_count,
     timer::{self, TimerState},
     watcher::Pair,
 };
-use bytemuck::{Pod, Zeroable};
-use spinning_top::{const_spinlock, Spinlock};
+use bytemuck::{CheckedBitPattern, Pod, Zeroable};
 
-#[cfg(all(not(test), target_arch = "wasm32"))]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
-}
+asr::panic_handler!();
 
-static STATE: Spinlock<State> = const_spinlock(State {
-    game: None,
-    settings: None,
-});
-
-#[derive(asr::Settings)]
+#[derive(Gui)]
 struct Settings {
     /// Get Smith's Sword
     #[default = true]
@@ -139,11 +132,6 @@ struct Settings {
     defeat_vaati: bool,
 }
 
-struct State {
-    game: Option<Game>,
-    settings: Option<Settings>,
-}
-
 struct Game {
     emulator: gba::Emulator,
     pause_menu: Watcher<PauseMenu>,
@@ -207,6 +195,7 @@ impl Game {
     }
 
     fn update_vars(&mut self) -> Option<Vars<'_>> {
+        self.emulator.update();
         Some(Vars {
             pause_menu: self.pause_menu.update(&self.emulator)?,
             scene: self.scene.update(&self.emulator)?,
@@ -263,7 +252,7 @@ struct Watcher<T> {
     address: u32,
 }
 
-impl<T: Pod> Watcher<T> {
+impl<T: CheckedBitPattern> Watcher<T> {
     fn new(address: u32) -> Self {
         Self {
             watcher: asr::watcher::Watcher::new(),
@@ -291,9 +280,16 @@ impl PauseMenu {
     }
 }
 
+unsafe impl Pod for InventoryItem {}
+unsafe impl Zeroable for InventoryItem {}
+unsafe impl Pod for Elements {}
+unsafe impl Zeroable for Elements {}
+unsafe impl Pod for PermanentEquipment {}
+unsafe impl Zeroable for PermanentEquipment {}
+
 bitflags::bitflags! {
-    #[derive(Pod, Zeroable)]
-    #[repr(C)]
+    #[derive(Copy, Clone)]
+    #[repr(transparent)]
     struct InventoryItem: u8 {
         const PAUSE_MENU = 1 << 0;
         const SMITHS_SWORD = 1 << 2;
@@ -326,8 +322,8 @@ bitflags::bitflags! {
         const OCARINA = 1 << 6;
     }
 
-    #[derive(Pod, Zeroable)]
-    #[repr(C)]
+    #[derive(Copy, Clone)]
+    #[repr(transparent)]
     struct Elements: u8 {
         const EARTH = 1 << 0;
         const FIRE = 1 << 2;
@@ -335,8 +331,8 @@ bitflags::bitflags! {
         const WIND = 1 << 6;
     }
 
-    #[derive(Pod, Zeroable)]
-    #[repr(C)]
+    #[derive(Copy, Clone)]
+    #[repr(transparent)]
     struct PermanentEquipment: u8 {
         const GRIP_RING = 1 << 0;
         const POWER_BRACELETS = 1 << 2;
@@ -416,65 +412,64 @@ mod inventory_slot {
     pub const OCARINA: usize = 5;
 }
 
-#[no_mangle]
-pub extern "C" fn update() {
-    let mut state = STATE.lock();
-    let state = &mut *state;
-    let settings = state.settings.get_or_insert_with(Settings::register);
-    if state.game.is_none() {
-        state.game = gba::Emulator::attach().map(Game::new_ntscj);
-    }
-    if let Some(game) = &mut state.game {
-        if !game.emulator.is_open() {
-            state.game = None;
-            return;
-        }
-        if let Some(mut vars) = game.update_vars() {
-            let mut string = ArrayString::<8>::new();
-            let hearts = vars.visual_hearts.current;
-            if !(1..=3).contains(&hearts) {
-                // Skip the 0 if we show a fraction.
-                string.push_str(itoa::Buffer::new().format(hearts / 4));
-            }
-            match hearts % 4 {
-                1 => string.push('¼'),
-                2 => string.push('½'),
-                3 => string.push('¾'),
-                _ => {}
-            }
-            timer::set_variable("Hearts", &string);
-            timer::set_variable_int("Rupees", vars.visual_rupees.current);
-            timer::set_variable_int("Keys", vars.visual_keys.current);
-            timer::set_variable_int("Tiger Scrolls", vars.tiger_scrolls.current);
-            timer::set_variable_int("Mysterious Shells", vars.mysterious_shells.current);
-            timer::set_variable_int("Bombs", vars.bombs.current);
+asr::async_main!(stable);
 
-            match timer::state() {
-                TimerState::NotRunning => {
-                    if vars.uix_position.current == 24
-                        && vars.uiy_position.old == 144
-                        && vars.uiy_position.current > 144
-                    {
-                        *vars.accumulated_frame_count = -(vars.frame_count.current as i64);
-                        *vars.run_progress = Default::default();
-                        timer::start();
-                        timer::pause_game_time();
-                    }
+async fn main() {
+    let mut settings = Settings::register();
+
+    loop {
+        let mut game = Game::new_ntscj(retry(gba::Emulator::attach).await);
+        while game.emulator.is_open() {
+            if let Some(mut vars) = game.update_vars() {
+                let mut string = ArrayString::<8>::new();
+                let hearts = vars.visual_hearts.current;
+                if !(1..=3).contains(&hearts) {
+                    // Skip the 0 if we show a fraction.
+                    string.push_str(itoa::Buffer::new().format(hearts / 4));
                 }
-                TimerState::Running | TimerState::Paused => {
-                    if vars.frame_count.current < vars.frame_count.old {
-                        *vars.accumulated_frame_count += vars.frame_count.old as i64 + 1;
-                    }
-
-                    timer::set_game_time(frame_count::<60>(vars.frame_count() as u64));
-
-                    if let Some(reason) = should_split(&mut vars, settings) {
-                        asr::print_message(reason);
-                        timer::split();
-                    }
+                match hearts % 4 {
+                    1 => string.push('¼'),
+                    2 => string.push('½'),
+                    3 => string.push('¾'),
+                    _ => {}
                 }
-                _ => {}
+                timer::set_variable("Hearts", &string);
+                timer::set_variable_int("Rupees", vars.visual_rupees.current);
+                timer::set_variable_int("Keys", vars.visual_keys.current);
+                timer::set_variable_int("Tiger Scrolls", vars.tiger_scrolls.current);
+                timer::set_variable_int("Mysterious Shells", vars.mysterious_shells.current);
+                timer::set_variable_int("Bombs", vars.bombs.current);
+
+                match timer::state() {
+                    TimerState::NotRunning => {
+                        if vars.uix_position.current == 24
+                            && vars.uiy_position.old == 144
+                            && vars.uiy_position.current > 144
+                        {
+                            *vars.accumulated_frame_count = -(vars.frame_count.current as i64);
+                            *vars.run_progress = Default::default();
+                            timer::start();
+                            timer::pause_game_time();
+                        }
+                    }
+                    TimerState::Running | TimerState::Paused => {
+                        if vars.frame_count.current < vars.frame_count.old {
+                            *vars.accumulated_frame_count += vars.frame_count.old as i64 + 1;
+                        }
+
+                        timer::set_game_time(frame_count::<60>(vars.frame_count() as u64));
+
+                        settings.update();
+                        if let Some(reason) = should_split(&mut vars, &settings) {
+                            asr::print_message(reason);
+                            timer::split();
+                        }
+                    }
+                    _ => {}
+                }
             }
+
+            next_tick().await;
         }
     }
 }

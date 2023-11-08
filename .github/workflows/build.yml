@@ -14,33 +14,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Commit
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Install Rust
         uses: hecrj/setup-rust-action@v1
         with:
           rust-version: stable
-
-      - name: Install Target
-        run: rustup target add wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown
 
       - name: Build
-        run: cargo build --target wasm32-unknown-unknown
+        run: |
+          cargo release --locked
+
+      - name: Release
+        if: github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: target/wasm32-unknown-unknown/release/minish_cap_auto_splitter.wasm
+          name: Latest
+          tag_name: latest
+          body: This contains the latest version of the auto splitter.
 
   clippy:
     name: Check clippy lints
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Commit
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Install Rust
         uses: hecrj/setup-rust-action@v1
         with:
-          rust-version: stable
-
-      - name: Install Target
-        run: rustup target add wasm32-unknown-unknown
+          components: clippy
+          targets: wasm32-unknown-unknown
 
       - name: Run Clippy
         run: cargo clippy --all-features
@@ -50,15 +56,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Commit
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Install Rust
         uses: hecrj/setup-rust-action@v1
         with:
-          rust-version: stable
-
-      - name: Install Target
-        run: rustup target add wasm32-unknown-unknown
+          components: rustfmt
 
       - name: Run cargo fmt
         run: cargo fmt -- --check || true
